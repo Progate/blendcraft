@@ -79,7 +79,7 @@ impl BlendCraftApp {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
-        let Some(path) = self.file_path.clone() else { return Err("no file name yet".into()) };
+        let path = self.file_path.clone().unwrap_or_else(|| PathBuf::from("/home/user/Documents/untitled.blendcraft"));
         self.save_as(path)
     }
 

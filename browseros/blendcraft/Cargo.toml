@@ -1,0 +1,19 @@
+[package]
+name = "blendcraft"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "A clean-room 3D creation app for BrowserOS, written in Rust"
+
+[lib]
+name = "blendcraft"
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

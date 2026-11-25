@@ -135,8 +135,14 @@ impl Camera {
     }
 }
 
+fn default_format_version() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
     pub objects: Vec<SceneObject>,
     pub selected: Option<u64>,
     pub next_id: u64,
@@ -145,7 +151,7 @@ pub struct Document {
 
 impl Default for Document {
     fn default() -> Self {
-        let mut document = Self { objects: Vec::new(), selected: None, next_id: 1, camera: Camera::default() };
+        let mut document = Self { format_version: default_format_version(), objects: Vec::new(), selected: None, next_id: 1, camera: Camera::default() };
         document.add(PrimitiveKind::Cube);
         document
     }

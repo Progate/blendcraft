@@ -48,6 +48,7 @@ pub struct BlendCraftApp {
     pub file_path: Option<PathBuf>,
     pub dirty: bool,
     pub quit_requested: bool,
+    confirm_close: bool,
     status: String,
     edit_selection_mode: EditSelectionMode,
     selected_vertex: Option<usize>,
@@ -75,6 +76,7 @@ impl BlendCraftApp {
             file_path: None,
             dirty: false,
             quit_requested: false,
+            confirm_close: false,
             status: "Ready".into(),
             edit_selection_mode: EditSelectionMode::Vertex,
             selected_vertex: None,
@@ -148,7 +150,6 @@ impl BlendCraftApp {
 
     pub fn logic(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
             return;
         }
         let (tab, delete, duplicate, grab, rotate, scale, extrude, inset, subdivide, split_edge, vertex_mode, edge_mode, face_mode, undo, redo, escape) = ctx
@@ -232,11 +233,19 @@ impl BlendCraftApp {
         if redo {
             self.redo_once();
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    pub fn request_quit(&mut self) {
+        if self.dirty {
+            self.confirm_close = true;
+        } else {
+            self.quit_requested = true;
+        }
     }
 
     pub fn close_requested(&mut self) -> bool {
-        !self.dirty
+        self.request_quit();
+        self.quit_requested
     }
 
     fn push_undo(&mut self) {
@@ -280,6 +289,7 @@ impl BlendCraftApp {
         });
         self.viewport(ui);
         self.file_dialog(ui);
+        self.close_dialog(ui);
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -322,7 +332,7 @@ impl BlendCraftApp {
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
-                    self.quit_requested = true;
+                    self.request_quit();
                     ui.close();
                 }
             });
@@ -942,6 +952,34 @@ impl BlendCraftApp {
         } else {
             self.status = "Cannot split that edge".into();
         }
+    }
+
+    fn close_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.confirm_close {
+            return;
+        }
+        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ui.ctx(), |ui| {
+            ui.label("Save changes before closing?");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    match self.save() {
+                        Ok(()) => {
+                            self.confirm_close = false;
+                            self.quit_requested = true;
+                        }
+                        Err(error) => self.status = error,
+                    }
+                }
+                if ui.button("Discard").clicked() {
+                    self.confirm_close = false;
+                    self.quit_requested = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_close = false;
+                }
+            });
+        });
     }
 
     fn file_dialog(&mut self, ui: &mut egui::Ui) {

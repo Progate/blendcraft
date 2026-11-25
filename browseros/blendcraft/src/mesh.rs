@@ -33,6 +33,34 @@ impl Mesh {
         }
     }
 
+    /// Extrude one triangular face along its geometric normal. The original face is replaced by
+    /// the moved cap and three side faces, as in a polygon modeling extrusion.
+    pub fn extrude_face(&mut self, face: usize, distance: f32) -> bool {
+        let Some(&[a, b, c]) = self.triangles.get(face) else { return false };
+        let (Some(&pa), Some(&pb), Some(&pc)) = (self.vertices.get(a), self.vertices.get(b), self.vertices.get(c)) else { return false };
+        let normal = (pb - pa).cross(pc - pa).normalized();
+        if normal.length() <= f32::EPSILON {
+            return false;
+        }
+        let offset = normal * distance;
+        let na = self.vertices.len();
+        self.vertices.push(pa + offset);
+        let nb = self.vertices.len();
+        self.vertices.push(pb + offset);
+        let nc = self.vertices.len();
+        self.vertices.push(pc + offset);
+        self.triangles.remove(face);
+        self.triangles.push([na, nb, nc]);
+        self.triangles.push([a, b, nb]);
+        self.triangles.push([a, nb, na]);
+        self.triangles.push([b, c, nc]);
+        self.triangles.push([b, nc, nb]);
+        self.triangles.push([c, a, na]);
+        self.triangles.push([c, na, nc]);
+        self.recompute_normals();
+        true
+    }
+
     pub fn cube() -> Self {
         let v = vec![
             Vec3::new(-1.0, -1.0, -1.0),

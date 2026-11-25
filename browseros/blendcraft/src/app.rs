@@ -21,6 +21,19 @@ pub enum Tool {
     Scale,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogKind {
+    Open,
+    SaveAs,
+    ExportObj,
+}
+
+struct DialogState {
+    kind: DialogKind,
+    path: String,
+    error: Option<String>,
+}
+
 pub struct BlendCraftApp {
     pub document: Document,
     pub mode: Mode,
@@ -30,6 +43,8 @@ pub struct BlendCraftApp {
     pub quit_requested: bool,
     status: String,
     selected_vertex: Option<usize>,
+    selected_face: Option<usize>,
+    dialog: Option<DialogState>,
     drag_start: Option<(egui::Pos2, Vec3)>,
     undo: Vec<Document>,
     redo: Vec<Document>,
@@ -52,6 +67,8 @@ impl BlendCraftApp {
             quit_requested: false,
             status: "Ready".into(),
             selected_vertex: None,
+            selected_face: None,
+            dialog: None,
             drag_start: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -117,7 +134,11 @@ impl BlendCraftApp {
     }
 
     pub fn logic(&mut self, ctx: &egui::Context) {
-        let (tab, delete, duplicate, grab, rotate, scale, undo, redo, escape) = ctx.input(|input| {
+        if ctx.egui_wants_keyboard_input() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
+        let (tab, delete, duplicate, grab, rotate, scale, extrude, undo, redo, escape) = ctx.input(|input| {
             (
                 input.key_pressed(Key::Tab),
                 input.key_pressed(Key::Delete) || input.key_pressed(Key::X),
@@ -125,6 +146,7 @@ impl BlendCraftApp {
                 input.key_pressed(Key::G),
                 input.key_pressed(Key::R),
                 input.key_pressed(Key::S),
+                input.key_pressed(Key::E),
                 input.modifiers.command && input.key_pressed(Key::Z) && !input.modifiers.shift,
                 (input.modifiers.command && input.key_pressed(Key::Y)) || (input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)),
                 input.key_pressed(Key::Escape),
@@ -138,6 +160,7 @@ impl BlendCraftApp {
         if tab {
             self.mode = if self.mode == Mode::Object { Mode::Edit } else { Mode::Object };
             self.selected_vertex = None;
+            self.selected_face = None;
             self.status = format!("{:?} mode", self.mode);
         }
         if grab {
@@ -148,6 +171,9 @@ impl BlendCraftApp {
         }
         if scale {
             self.tool = Tool::Scale;
+        }
+        if extrude {
+            self.extrude_selected_face();
         }
         if delete && self.mode == Mode::Object {
             self.push_undo();
@@ -212,6 +238,7 @@ impl BlendCraftApp {
             });
         });
         self.viewport(ui);
+        self.file_dialog(ui);
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -224,6 +251,10 @@ impl BlendCraftApp {
                     self.dirty = true;
                     ui.close();
                 }
+                if ui.button("Open…").clicked() {
+                    self.open_dialog(DialogKind::Open, "/home/user/Documents/scene.blendcraft");
+                    ui.close();
+                }
                 if ui.button("Save").clicked() {
                     if let Err(error) = self.save() {
                         self.status = error
@@ -232,12 +263,20 @@ impl BlendCraftApp {
                     }
                     ui.close();
                 }
+                if ui.button("Save As…").clicked() {
+                    let path =
+                        self.file_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "/home/user/Documents/untitled.blendcraft".into());
+                    self.open_dialog(DialogKind::SaveAs, &path);
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Export OBJ…").clicked() {
-                    let path = self.file_path.clone().unwrap_or_else(|| PathBuf::from("scene.blendcraft")).with_extension("obj");
-                    if let Err(error) = self.export_obj(path) {
-                        self.status = error
-                    }
+                    let path = self
+                        .file_path
+                        .as_ref()
+                        .map(|path| path.with_extension("obj").display().to_string())
+                        .unwrap_or_else(|| "/home/user/Documents/scene.obj".into());
+                    self.open_dialog(DialogKind::ExportObj, &path);
                     ui.close();
                 }
                 ui.separator();
@@ -507,8 +546,18 @@ impl BlendCraftApp {
             }
         }
         self.selected_vertex = best;
+        self.selected_face = None;
         if best.is_some() {
             self.status = "Vertex selected".into();
+        } else {
+            let point = egui::pos2(local.x, local.y);
+            let triangles = render_scene(&self.document, width, height);
+            let hit = triangles.iter().rev().find(|triangle| Some(triangle.object_id) == self.document.selected && point_in_triangle(point, triangle.points));
+            if let Some(hit) = hit {
+                let triangle_index = hit.triangle_index;
+                self.selected_face = Some(triangle_index);
+                self.status = format!("Face {} selected", triangle_index);
+            }
         }
     }
 
@@ -567,6 +616,78 @@ impl BlendCraftApp {
     }
 }
 
+impl BlendCraftApp {
+    fn open_dialog(&mut self, kind: DialogKind, path: &str) {
+        self.dialog = Some(DialogState { kind, path: path.to_string(), error: None });
+    }
+
+    fn extrude_selected_face(&mut self) {
+        if self.mode != Mode::Edit {
+            return;
+        }
+        let (Some(object_id), Some(face)) = (self.document.selected, self.selected_face) else {
+            self.status = "Select a face in edit mode first".into();
+            return;
+        };
+        self.push_undo();
+        let Some(object) = self.document.object_mut(object_id) else { return };
+        if object.mesh.extrude_face(face, 1.0) {
+            self.selected_vertex = None;
+            self.selected_face = None;
+            self.dirty = true;
+            self.status = "Face extruded".into();
+        } else {
+            self.status = "Cannot extrude that face".into();
+        }
+    }
+
+    fn file_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(mut dialog) = self.dialog.take() else { return };
+        let title = match dialog.kind {
+            DialogKind::Open => "Open Scene or OBJ",
+            DialogKind::SaveAs => "Save Scene As",
+            DialogKind::ExportObj => "Export OBJ",
+        };
+        let mut open = true;
+        let mut keep_dialog = true;
+        egui::Window::new(title).collapsible(false).resizable(false).open(&mut open).show(ui.ctx(), |ui| {
+            ui.label("BrowserOS path");
+            ui.text_edit_singleline(&mut dialog.path);
+            if let Some(error) = &dialog.error {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), error);
+            }
+            ui.horizontal(|ui| {
+                let action = match dialog.kind {
+                    DialogKind::Open => "Open",
+                    DialogKind::SaveAs => "Save",
+                    DialogKind::ExportObj => "Export",
+                };
+                if ui.button(action).clicked() {
+                    let path = dialog.path.trim().to_string();
+                    let result = match dialog.kind {
+                        DialogKind::Open => self.open_path(&path),
+                        DialogKind::SaveAs => self.save_as(&path),
+                        DialogKind::ExportObj => self.export_obj(&path),
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.status = format!("{}: {}", action, path);
+                            keep_dialog = false;
+                        }
+                        Err(error) => dialog.error = Some(error),
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    keep_dialog = false;
+                }
+            });
+        });
+        if open && keep_dialog {
+            self.dialog = Some(dialog);
+        }
+    }
+}
+
 fn object_transform_project(document: &Document, _object: &crate::scene::SceneObject, world: Vec3, width: f32, height: f32) -> Option<(egui::Pos2, f32)> {
     document.camera.project(world, width, height)
 }
@@ -621,6 +742,15 @@ pub fn parse_obj(bytes: &[u8]) -> Result<Mesh, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extrude_face_replaces_cap_and_adds_sides() {
+        let mut mesh = Mesh::cube();
+        let before = mesh.triangles.len();
+        assert!(mesh.extrude_face(0, 1.0));
+        assert_eq!(mesh.triangles.len(), before + 6);
+        assert_eq!(mesh.vertices.len(), 11);
+    }
 
     #[test]
     fn obj_roundtrip_mesh() {

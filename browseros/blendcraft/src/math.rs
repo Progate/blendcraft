@@ -115,3 +115,37 @@ pub fn vec3_ui(ui: &mut egui::Ui, label: &str, value: &mut Vec3, speed: f32) {
         ui.add(egui::DragValue::new(&mut value.z).speed(speed).prefix("Z "));
     });
 }
+
+/// Undo the X-then-Y-then-Z Euler rotation used by scene objects.
+pub fn inverse_rotate_euler(point: Vec3, rotation: Vec3) -> Vec3 {
+    let mut v = point;
+    let (sz, cz) = (-rotation.z).sin_cos();
+    let (x, y) = (v.x * cz - v.y * sz, v.x * sz + v.y * cz);
+    v.x = x;
+    v.y = y;
+    let (sy, cy) = (-rotation.y).sin_cos();
+    let (x, z) = (v.x * cy + v.z * sy, -v.x * sy + v.z * cy);
+    v.x = x;
+    v.z = z;
+    let (sx, cx) = (-rotation.x).sin_cos();
+    let (y, z) = (v.y * cx - v.z * sx, v.y * sx + v.z * cx);
+    v.y = y;
+    v.z = z;
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_rotate_euler_restores_vector() {
+        let point = Vec3::new(0.4, -1.2, 2.5);
+        for rotation in [Vec3::new(0.2, -0.4, 0.8), Vec3::new(-1.1, 0.3, -0.2), Vec3::new(1.2, 1.0, -0.7)] {
+            let restored = inverse_rotate_euler(point.rotate(rotation), rotation);
+            assert!((restored.x - point.x).abs() < 0.0001);
+            assert!((restored.y - point.y).abs() < 0.0001);
+            assert!((restored.z - point.z).abs() < 0.0001);
+        }
+    }
+}

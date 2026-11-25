@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use egui::{Color32, Key, PointerButton, RichText, Sense, Stroke};
 
-use crate::math::{Vec3, vec3_ui};
+use crate::math::{Vec3, inverse_rotate_euler, vec3_ui};
 use crate::mesh::Mesh;
-use crate::render::{point_in_triangle, render_scene};
+use crate::render::{point_in_triangle, rasterize_scene, render_scene};
 use crate::scene::{Document, PrimitiveKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +19,13 @@ pub enum Tool {
     Grab,
     Rotate,
     Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditSelectionMode {
+    Vertex,
+    Edge,
+    Face,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +49,12 @@ pub struct BlendCraftApp {
     pub dirty: bool,
     pub quit_requested: bool,
     status: String,
+    edit_selection_mode: EditSelectionMode,
     selected_vertex: Option<usize>,
+    selected_edge: Option<(usize, usize)>,
     selected_face: Option<usize>,
     dialog: Option<DialogState>,
+    viewport_texture: Option<egui::TextureHandle>,
     drag_start: Option<(egui::Pos2, Vec3)>,
     undo: Vec<Document>,
     redo: Vec<Document>,
@@ -66,9 +76,12 @@ impl BlendCraftApp {
             dirty: false,
             quit_requested: false,
             status: "Ready".into(),
+            edit_selection_mode: EditSelectionMode::Vertex,
             selected_vertex: None,
+            selected_edge: None,
             selected_face: None,
             dialog: None,
+            viewport_texture: None,
             drag_start: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -138,20 +151,27 @@ impl BlendCraftApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
             return;
         }
-        let (tab, delete, duplicate, grab, rotate, scale, extrude, undo, redo, escape) = ctx.input(|input| {
-            (
-                input.key_pressed(Key::Tab),
-                input.key_pressed(Key::Delete) || input.key_pressed(Key::X),
-                input.key_pressed(Key::D),
-                input.key_pressed(Key::G),
-                input.key_pressed(Key::R),
-                input.key_pressed(Key::S),
-                input.key_pressed(Key::E),
-                input.modifiers.command && input.key_pressed(Key::Z) && !input.modifiers.shift,
-                (input.modifiers.command && input.key_pressed(Key::Y)) || (input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)),
-                input.key_pressed(Key::Escape),
-            )
-        });
+        let (tab, delete, duplicate, grab, rotate, scale, extrude, inset, subdivide, split_edge, vertex_mode, edge_mode, face_mode, undo, redo, escape) = ctx
+            .input(|input| {
+                (
+                    input.key_pressed(Key::Tab),
+                    input.key_pressed(Key::Delete) || input.key_pressed(Key::X),
+                    input.key_pressed(Key::D),
+                    input.key_pressed(Key::G),
+                    input.key_pressed(Key::R),
+                    input.key_pressed(Key::S),
+                    input.key_pressed(Key::E),
+                    input.key_pressed(Key::I),
+                    input.key_pressed(Key::U),
+                    input.key_pressed(Key::B),
+                    input.key_pressed(Key::Num1),
+                    input.key_pressed(Key::Num2),
+                    input.key_pressed(Key::Num3),
+                    input.modifiers.command && input.key_pressed(Key::Z) && !input.modifiers.shift,
+                    (input.modifiers.command && input.key_pressed(Key::Y)) || (input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)),
+                    input.key_pressed(Key::Escape),
+                )
+            });
         if escape {
             self.tool = Tool::Select;
             self.drag_start = None;
@@ -159,8 +179,7 @@ impl BlendCraftApp {
         }
         if tab {
             self.mode = if self.mode == Mode::Object { Mode::Edit } else { Mode::Object };
-            self.selected_vertex = None;
-            self.selected_face = None;
+            self.clear_edit_selection();
             self.status = format!("{:?} mode", self.mode);
         }
         if grab {
@@ -172,8 +191,26 @@ impl BlendCraftApp {
         if scale {
             self.tool = Tool::Scale;
         }
+        if vertex_mode {
+            self.set_edit_selection_mode(EditSelectionMode::Vertex);
+        }
+        if edge_mode {
+            self.set_edit_selection_mode(EditSelectionMode::Edge);
+        }
+        if face_mode {
+            self.set_edit_selection_mode(EditSelectionMode::Face);
+        }
         if extrude {
             self.extrude_selected_face();
+        }
+        if inset {
+            self.inset_selected_face();
+        }
+        if subdivide {
+            self.subdivide_selected_mesh();
+        }
+        if split_edge {
+            self.split_selected_edge();
         }
         if delete && self.mode == Mode::Object {
             self.push_undo();
@@ -234,7 +271,11 @@ impl BlendCraftApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} · {:?} · {:?} tool", self.status, self.mode, self.tool)).small());
                 ui.separator();
-                ui.label(RichText::new("Tab edit/object · G/R/S transform · MMB orbit · Shift+MMB pan · wheel zoom").small().weak());
+                ui.label(
+                    RichText::new("Tab edit/object · 1/2/3 vertex/edge/face · E extrude · I inset · U subdivide · B split edge · G/R/S transform")
+                        .small()
+                        .weak(),
+                );
             });
         });
         self.viewport(ui);
@@ -318,13 +359,39 @@ impl BlendCraftApp {
                     self.dirty = true;
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Extrude Face").clicked() {
+                    self.extrude_selected_face();
+                    ui.close();
+                }
+                if ui.button("Inset Face").clicked() {
+                    self.inset_selected_face();
+                    ui.close();
+                }
+                if ui.button("Subdivide Mesh").clicked() {
+                    self.subdivide_selected_mesh();
+                    ui.close();
+                }
+                if ui.button("Split Edge").clicked() {
+                    self.split_selected_edge();
+                    ui.close();
+                }
             });
             ui.menu_button("View", |ui| {
                 if ui.button("Frame All").clicked() {
-                    self.document.camera.target = Vec3::ZERO;
-                    self.document.camera.distance = 8.0;
+                    self.frame_all();
                     ui.close();
                 }
+                ui.separator();
+                for (label, yaw, pitch) in [("Perspective", -0.7, 0.45), ("Front", 0.0, 0.0), ("Right", std::f32::consts::FRAC_PI_2, 0.0), ("Top", 0.0, 1.45)] {
+                    if ui.button(label).clicked() {
+                        self.document.camera.yaw = yaw;
+                        self.document.camera.pitch = pitch;
+                        self.status = format!("{label} view");
+                        ui.close();
+                    }
+                }
+                ui.separator();
                 if ui.button(if self.mode == Mode::Object { "Edit Mode" } else { "Object Mode" }).clicked() {
                     self.mode = if self.mode == Mode::Object { Mode::Edit } else { Mode::Object };
                     ui.close();
@@ -417,11 +484,58 @@ impl BlendCraftApp {
         ui.add_space(6.0);
         ui.label(RichText::new("Mesh").strong());
         ui.label(format!("{} vertices · {} triangles", object.mesh.vertices.len(), object.mesh.triangles.len()));
+        let mut mesh_operation = 0;
         if self.mode == Mode::Edit {
-            ui.label("Click near a vertex to select it; drag to move it in the view plane.");
-            if let Some(vertex) = self.selected_vertex {
-                ui.label(format!("Selected vertex #{vertex}"));
+            let before_selection_mode = self.edit_selection_mode;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.edit_selection_mode, EditSelectionMode::Vertex, "Vertex");
+                ui.selectable_value(&mut self.edit_selection_mode, EditSelectionMode::Edge, "Edge");
+                ui.selectable_value(&mut self.edit_selection_mode, EditSelectionMode::Face, "Face");
+            });
+            if self.edit_selection_mode != before_selection_mode {
+                self.clear_edit_selection();
             }
+            ui.label("Click a mesh element to select it; drag to move it in the view plane.");
+            match self.edit_selection_mode {
+                EditSelectionMode::Vertex => {
+                    if let Some(vertex) = self.selected_vertex {
+                        ui.label(format!("Selected vertex #{vertex}"));
+                    }
+                }
+                EditSelectionMode::Edge => {
+                    if let Some((a, b)) = self.selected_edge {
+                        ui.label(format!("Selected edge {a}–{b}"));
+                    }
+                }
+                EditSelectionMode::Face => {
+                    if let Some(face) = self.selected_face {
+                        ui.label(format!("Selected face #{face}"));
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Extrude").clicked() {
+                    mesh_operation = 1;
+                }
+                if ui.button("Inset").clicked() {
+                    mesh_operation = 2;
+                }
+                if ui.button("Subdivide").clicked() {
+                    mesh_operation = 3;
+                }
+                if ui.button("Split edge").clicked() {
+                    mesh_operation = 4;
+                }
+            });
+        }
+        if mesh_operation == 1 {
+            self.extrude_selected_face();
+        } else if mesh_operation == 2 {
+            self.inset_selected_face();
+        } else if mesh_operation == 3 {
+            self.subdivide_selected_mesh();
+        } else if mesh_operation == 4 {
+            self.split_selected_edge();
         }
     }
 
@@ -434,21 +548,66 @@ impl BlendCraftApp {
         let width = rect.width().max(1.0);
         let height = rect.height().max(1.0);
         let triangles = render_scene(&self.document, width, height);
-        for triangle in &triangles {
-            let points = triangle.points.iter().map(|p| rect.min + p.to_vec2()).collect::<Vec<_>>();
-            painter.add(egui::Shape::convex_polygon(points, triangle.color, Stroke::NONE));
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let pixel_width = (width * pixels_per_point).round().max(1.0) as usize;
+        let pixel_height = (height * pixels_per_point).round().max(1.0) as usize;
+        let image = rasterize_scene(&self.document, pixel_width, pixel_height);
+        let texture = self.viewport_texture.get_or_insert_with(|| {
+            ui.ctx().load_texture("blendcraft-scene", egui::ColorImage::new([1, 1], vec![Color32::TRANSPARENT]), egui::TextureOptions::NEAREST)
+        });
+        if texture.size() != [pixel_width, pixel_height] {
+            *texture = ui.ctx().load_texture("blendcraft-scene", image, egui::TextureOptions::NEAREST);
+        } else {
+            texture.set(image, egui::TextureOptions::NEAREST);
         }
+        painter.image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         if let Some(selected) = self.document.selected {
             for triangle in triangles.iter().filter(|triangle| triangle.object_id == selected) {
                 let points = triangle.points.iter().map(|p| rect.min + p.to_vec2()).collect::<Vec<_>>();
                 painter.add(egui::Shape::closed_line(points, Stroke::new(1.0, Color32::from_rgb(255, 166, 64))));
             }
         }
+        if self.mode == Mode::Edit {
+            if let Some(selected) = self.document.selected {
+                if self.edit_selection_mode == EditSelectionMode::Face {
+                    if let Some(face) = self.selected_face {
+                        for triangle in triangles.iter().filter(|triangle| triangle.object_id == selected && triangle.triangle_index == face) {
+                            let points = triangle.points.iter().map(|p| rect.min + p.to_vec2()).collect::<Vec<_>>();
+                            painter.add(egui::Shape::closed_line(points, Stroke::new(2.0, Color32::from_rgb(80, 190, 255))));
+                        }
+                    }
+                }
+                if let Some(object) = self.document.object(selected) {
+                    if self.edit_selection_mode == EditSelectionMode::Edge {
+                        if let Some((a, b)) = self.selected_edge {
+                            let endpoints = [a, b]
+                                .iter()
+                                .filter_map(|&index| object.mesh.vertices.get(index))
+                                .filter_map(|&vertex| self.document.camera.project(object.transform_point(vertex), width, height))
+                                .map(|(point, _)| rect.min + point.to_vec2())
+                                .collect::<Vec<_>>();
+                            if endpoints.len() == 2 {
+                                painter.line_segment([endpoints[0], endpoints[1]], Stroke::new(3.0, Color32::from_rgb(80, 190, 255)));
+                            }
+                        }
+                    }
+                    if self.edit_selection_mode == EditSelectionMode::Vertex {
+                        if let Some(vertex) = self.selected_vertex {
+                            if let Some(local) = object.mesh.vertices.get(vertex) {
+                                if let Some((point, _)) = self.document.camera.project(object.transform_point(*local), width, height) {
+                                    painter.circle_filled(rect.min + point.to_vec2(), 4.0, Color32::from_rgb(80, 190, 255));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.viewport_input(ui, &response, rect);
         painter.text(
             rect.left_top() + egui::vec2(8.0, 8.0),
             egui::Align2::LEFT_TOP,
-            format!("{:?} mode", self.mode),
+            format!("{:?} mode · {:?}", self.mode, self.edit_selection_mode),
             egui::FontId::proportional(13.0),
             Color32::from_gray(210),
         );
@@ -504,14 +663,14 @@ impl BlendCraftApp {
         {
             let local = pos - rect.min;
             if self.mode == Mode::Edit {
-                self.pick_vertex(local, width, height);
+                self.pick_edit_element(local, width, height);
             } else {
                 self.pick_object(local, width, height);
             }
         }
         if response.dragged_by(PointerButton::Primary) {
             if self.mode == Mode::Edit {
-                self.drag_vertex(delta, width, height);
+                self.drag_edit_selection(delta, width, height);
             } else if self.tool != Tool::Select {
                 self.drag_object(delta, width, height);
             }
@@ -530,59 +689,116 @@ impl BlendCraftApp {
         }
     }
 
-    fn pick_vertex(&mut self, local: egui::Vec2, width: f32, height: f32) {
+    fn pick_edit_element(&mut self, local: egui::Vec2, width: f32, height: f32) {
         let Some(id) = self.document.selected else { return };
         let Some(object) = self.document.object(id) else { return };
-        let mut best = None;
-        let mut best_distance = 12.0f32;
-        for (index, vertex) in object.mesh.vertices.iter().enumerate() {
-            let world = object.transform_point(*vertex);
-            if let Some((screen, _)) = object_transform_project(&self.document, object, world, width, height) {
-                let distance = screen.distance(egui::pos2(local.x, local.y));
-                if distance < best_distance {
-                    best_distance = distance;
-                    best = Some(index);
+        let point = egui::pos2(local.x, local.y);
+        match self.edit_selection_mode {
+            EditSelectionMode::Vertex => {
+                let mut best = None;
+                let mut best_distance = 12.0f32;
+                for (index, vertex) in object.mesh.vertices.iter().enumerate() {
+                    let world = object.transform_point(*vertex);
+                    if let Some((screen, _)) = object_transform_project(&self.document, object, world, width, height) {
+                        let distance = screen.distance(point);
+                        if distance < best_distance {
+                            best_distance = distance;
+                            best = Some(index);
+                        }
+                    }
                 }
+                self.selected_vertex = best;
+                self.selected_edge = None;
+                self.selected_face = None;
+                self.status = if best.is_some() { "Vertex selected".into() } else { "No vertex hit".into() };
             }
-        }
-        self.selected_vertex = best;
-        self.selected_face = None;
-        if best.is_some() {
-            self.status = "Vertex selected".into();
-        } else {
-            let point = egui::pos2(local.x, local.y);
-            let triangles = render_scene(&self.document, width, height);
-            let hit = triangles.iter().rev().find(|triangle| Some(triangle.object_id) == self.document.selected && point_in_triangle(point, triangle.points));
-            if let Some(hit) = hit {
-                let triangle_index = hit.triangle_index;
-                self.selected_face = Some(triangle_index);
-                self.status = format!("Face {} selected", triangle_index);
+            EditSelectionMode::Edge => {
+                let mut edges = Vec::<(usize, usize)>::new();
+                for [a, b, c] in &object.mesh.triangles {
+                    for (u, v) in [(*a, *b), (*b, *c), (*c, *a)] {
+                        let edge = (u.min(v), u.max(v));
+                        if !edges.contains(&edge) {
+                            edges.push(edge);
+                        }
+                    }
+                }
+                let mut best = None;
+                let mut best_distance = 10.0f32;
+                for edge in edges {
+                    let (pa, pb) = (object.mesh.vertices[edge.0], object.mesh.vertices[edge.1]);
+                    let (Some((sa, _)), Some((sb, _))) = (
+                        object_transform_project(&self.document, object, object.transform_point(pa), width, height),
+                        object_transform_project(&self.document, object, object.transform_point(pb), width, height),
+                    ) else {
+                        continue;
+                    };
+                    let distance = distance_to_segment(point, sa, sb);
+                    if distance < best_distance {
+                        best_distance = distance;
+                        best = Some(edge);
+                    }
+                }
+                self.selected_vertex = None;
+                self.selected_edge = best;
+                self.selected_face = None;
+                self.status = if let Some((a, b)) = best { format!("Edge {a}–{b} selected") } else { "No edge hit".into() };
+            }
+            EditSelectionMode::Face => {
+                let triangles = render_scene(&self.document, width, height);
+                let hit =
+                    triangles.iter().rev().find(|triangle| Some(triangle.object_id) == self.document.selected && point_in_triangle(point, triangle.points));
+                self.selected_vertex = None;
+                self.selected_edge = None;
+                self.selected_face = hit.map(|triangle| triangle.triangle_index);
+                self.status = if let Some(face) = self.selected_face { format!("Face {face} selected") } else { "No face hit".into() };
             }
         }
     }
 
-    fn drag_vertex(&mut self, delta: egui::Vec2, _width: f32, height: f32) {
-        let (Some(id), Some(index)) = (self.document.selected, self.selected_vertex) else { return };
-        if self.drag_start.is_none() {
-            if let Some(object) = self.document.object(id).and_then(|object| object.mesh.vertices.get(index)).copied() {
-                self.drag_start = Some((egui::pos2(0.0, 0.0), object));
-                self.push_undo();
-            }
+    fn selected_vertex_indices(&self) -> Vec<usize> {
+        let Some(id) = self.document.selected else { return Vec::new() };
+        match self.edit_selection_mode {
+            EditSelectionMode::Vertex => self.selected_vertex.into_iter().collect(),
+            EditSelectionMode::Edge => self.selected_edge.map(|(a, b)| vec![a, b]).unwrap_or_default(),
+            EditSelectionMode::Face => self
+                .selected_face
+                .and_then(|face| self.document.object(id).and_then(|object| object.mesh.triangles.get(face)).copied())
+                .map(|triangle| triangle.to_vec())
+                .unwrap_or_default(),
         }
-        let Some((_, start_vertex)) = self.drag_start else { return };
+    }
+
+    fn drag_edit_selection(&mut self, delta: egui::Vec2, _width: f32, height: f32) {
+        let Some(id) = self.document.selected else { return };
+        let indices = self.selected_vertex_indices();
+        if indices.is_empty() {
+            return;
+        }
+        if self.drag_start.is_none() {
+            self.drag_start = Some((egui::pos2(0.0, 0.0), Vec3::ZERO));
+            self.push_undo();
+        }
         let camera = self.document.camera;
         let (_, right, up, forward) = camera.basis();
         let focal = (height * 0.5) / (camera.fov_y_degrees.to_radians() * 0.5).tan();
-        let depth = (camera.eye() - self.document.object(id).map(|object| object.transform_point(start_vertex)).unwrap_or(Vec3::ZERO)).dot(forward).max(0.5);
+        let Some(object) = self.document.object(id) else { return };
+        let center =
+            indices.iter().filter_map(|&index| object.mesh.vertices.get(index)).copied().fold(Vec3::ZERO, |sum, point| sum + object.transform_point(point))
+                / indices.len() as f32;
+        let depth = (center - camera.eye()).dot(forward).max(0.5);
         let world_delta = right * (delta.x * depth / focal) + up * (-delta.y * depth / focal);
-        if let Some(object) = self.document.object_mut(id)
-            && let Some(vertex) = object.mesh.vertices.get_mut(index)
-        {
-            let inverse_rotation = Vec3::new(-object.rotation.x, -object.rotation.y, -object.rotation.z);
-            let local_delta = world_delta.rotate(inverse_rotation);
-            vertex.x += local_delta.x / object.scale.x.max(0.001);
-            vertex.y += local_delta.y / object.scale.y.max(0.001);
-            vertex.z += local_delta.z / object.scale.z.max(0.001);
+        if let Some(object) = self.document.object_mut(id) {
+            let local_delta = inverse_rotate_euler(world_delta, object.rotation);
+            let sx = if object.scale.x.abs() < 0.001 { 0.001_f32.copysign(object.scale.x) } else { object.scale.x };
+            let sy = if object.scale.y.abs() < 0.001 { 0.001_f32.copysign(object.scale.y) } else { object.scale.y };
+            let sz = if object.scale.z.abs() < 0.001 { 0.001_f32.copysign(object.scale.z) } else { object.scale.z };
+            for index in indices {
+                if let Some(vertex) = object.mesh.vertices.get_mut(index) {
+                    vertex.x += local_delta.x / sx;
+                    vertex.y += local_delta.y / sy;
+                    vertex.z += local_delta.z / sz;
+                }
+            }
             object.mesh.recompute_normals();
             self.dirty = true;
         }
@@ -617,6 +833,42 @@ impl BlendCraftApp {
 }
 
 impl BlendCraftApp {
+    fn clear_edit_selection(&mut self) {
+        self.selected_vertex = None;
+        self.selected_edge = None;
+        self.selected_face = None;
+    }
+
+    fn set_edit_selection_mode(&mut self, mode: EditSelectionMode) {
+        if self.mode != Mode::Edit || self.edit_selection_mode == mode {
+            return;
+        }
+        self.edit_selection_mode = mode;
+        self.clear_edit_selection();
+        self.status = format!("{:?} selection", mode);
+    }
+
+    fn frame_all(&mut self) {
+        let mut low: Option<Vec3> = None;
+        let mut high: Option<Vec3> = None;
+        for object in self.document.objects.iter().filter(|object| object.visible) {
+            for vertex in &object.mesh.vertices {
+                let point = object.transform_point(*vertex);
+                low = Some(low.map_or(point, |current: Vec3| current.min(point)));
+                high = Some(high.map_or(point, |current: Vec3| current.max(point)));
+            }
+        }
+        if let (Some(low), Some(high)) = (low, high) {
+            let center = (low + high) / 2.0;
+            let extent = (high - low).length().max(1.0);
+            self.document.camera.target = center;
+            self.document.camera.distance = (extent * 1.2).clamp(2.0, 100.0);
+        } else {
+            self.document.camera.target = Vec3::ZERO;
+            self.document.camera.distance = 8.0;
+        }
+    }
+
     fn open_dialog(&mut self, kind: DialogKind, path: &str) {
         self.dialog = Some(DialogState { kind, path: path.to_string(), error: None });
     }
@@ -638,6 +890,57 @@ impl BlendCraftApp {
             self.status = "Face extruded".into();
         } else {
             self.status = "Cannot extrude that face".into();
+        }
+    }
+
+    fn inset_selected_face(&mut self) {
+        if self.mode != Mode::Edit {
+            return;
+        }
+        let (Some(object_id), Some(face)) = (self.document.selected, self.selected_face) else {
+            self.status = "Select a face in edit mode first".into();
+            return;
+        };
+        self.push_undo();
+        let Some(object) = self.document.object_mut(object_id) else { return };
+        if object.mesh.inset_face(face, 0.3) {
+            self.clear_edit_selection();
+            self.dirty = true;
+            self.status = "Face inset".into();
+        } else {
+            self.status = "Cannot inset that face".into();
+        }
+    }
+
+    fn subdivide_selected_mesh(&mut self) {
+        if self.mode != Mode::Edit {
+            return;
+        }
+        let Some(object_id) = self.document.selected else { return };
+        self.push_undo();
+        let Some(object) = self.document.object_mut(object_id) else { return };
+        object.mesh.subdivide();
+        self.clear_edit_selection();
+        self.dirty = true;
+        self.status = "Mesh subdivided".into();
+    }
+
+    fn split_selected_edge(&mut self) {
+        if self.mode != Mode::Edit {
+            return;
+        }
+        let (Some(object_id), Some((a, b))) = (self.document.selected, self.selected_edge) else {
+            self.status = "Select an edge in edit mode first".into();
+            return;
+        };
+        self.push_undo();
+        let Some(object) = self.document.object_mut(object_id) else { return };
+        if object.mesh.split_edge(a, b) {
+            self.clear_edit_selection();
+            self.dirty = true;
+            self.status = "Edge split".into();
+        } else {
+            self.status = "Cannot split that edge".into();
         }
     }
 
@@ -686,6 +989,17 @@ impl BlendCraftApp {
             self.dialog = Some(dialog);
         }
     }
+}
+
+fn distance_to_segment(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let length_squared = ab.x * ab.x + ab.y * ab.y;
+    if length_squared <= f32::EPSILON {
+        return point.distance(a);
+    }
+    let ap = point - a;
+    let t = ((ap.x * ab.x + ap.y * ab.y) / length_squared).clamp(0.0, 1.0);
+    point.distance(a + ab * t)
 }
 
 fn object_transform_project(document: &Document, _object: &crate::scene::SceneObject, world: Vec3, width: f32, height: f32) -> Option<(egui::Pos2, f32)> {
@@ -750,6 +1064,24 @@ mod tests {
         assert!(mesh.extrude_face(0, 1.0));
         assert_eq!(mesh.triangles.len(), before + 6);
         assert_eq!(mesh.vertices.len(), 11);
+    }
+
+    #[test]
+    fn inset_and_split_and_subdivide_update_topology() {
+        let mut mesh = Mesh::cube();
+        assert!(mesh.inset_face(0, 0.3));
+        assert_eq!(mesh.vertices.len(), 11);
+        assert_eq!(mesh.triangles.len(), 18);
+
+        let mut mesh = Mesh::cube();
+        assert!(mesh.split_edge(0, 1));
+        assert_eq!(mesh.vertices.len(), 9);
+        assert_eq!(mesh.triangles.len(), 14);
+
+        let mut mesh = Mesh::cube();
+        mesh.subdivide();
+        assert_eq!(mesh.vertices.len(), 26);
+        assert_eq!(mesh.triangles.len(), 48);
     }
 
     #[test]

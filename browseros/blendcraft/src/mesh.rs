@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::math::Vec3;
@@ -59,6 +61,99 @@ impl Mesh {
         self.triangles.push([c, na, nc]);
         self.recompute_normals();
         true
+    }
+
+    /// Inset one triangular face toward its centroid. The original face is replaced by the inner
+    /// cap and a triangular ring, which is the triangular analogue of a polygon inset.
+    pub fn inset_face(&mut self, face: usize, amount: f32) -> bool {
+        let Some(&[a, b, c]) = self.triangles.get(face) else { return false };
+        let (Some(&pa), Some(&pb), Some(&pc)) = (self.vertices.get(a), self.vertices.get(b), self.vertices.get(c)) else { return false };
+        let amount = amount.clamp(0.01, 0.9);
+        let center = (pa + pb + pc) / 3.0;
+        let na = self.vertices.len();
+        self.vertices.push(pa + (center - pa) * amount);
+        let nb = self.vertices.len();
+        self.vertices.push(pb + (center - pb) * amount);
+        let nc = self.vertices.len();
+        self.vertices.push(pc + (center - pc) * amount);
+        self.triangles.remove(face);
+        self.triangles.push([na, nb, nc]);
+        self.triangles.push([a, b, nb]);
+        self.triangles.push([a, nb, na]);
+        self.triangles.push([b, c, nc]);
+        self.triangles.push([b, nc, nb]);
+        self.triangles.push([c, a, na]);
+        self.triangles.push([c, na, nc]);
+        self.recompute_normals();
+        true
+    }
+
+    /// Split every triangle into four triangles, sharing the midpoint vertices on shared edges.
+    pub fn subdivide(&mut self) {
+        if self.triangles.is_empty() {
+            return;
+        }
+        let mut midpoints = HashMap::<(usize, usize), usize>::new();
+        let mut divided = Vec::with_capacity(self.triangles.len() * 4);
+        for [a, b, c] in self.triangles.iter().copied() {
+            let mut midpoint = |u: usize, v: usize, vertices: &mut Vec<Vec3>| {
+                let key = (u.min(v), u.max(v));
+                *midpoints.entry(key).or_insert_with(|| {
+                    let point = (vertices[u] + vertices[v]) * 0.5;
+                    vertices.push(point);
+                    vertices.len() - 1
+                })
+            };
+            let ab = midpoint(a, b, &mut self.vertices);
+            let bc = midpoint(b, c, &mut self.vertices);
+            let ca = midpoint(c, a, &mut self.vertices);
+            divided.push([a, ab, ca]);
+            divided.push([ab, b, bc]);
+            divided.push([ca, bc, c]);
+            divided.push([ab, bc, ca]);
+        }
+        self.triangles = divided;
+        self.recompute_normals();
+    }
+
+    /// Split every triangle incident to an edge at its midpoint, preserving triangle winding.
+    pub fn split_edge(&mut self, a: usize, b: usize) -> bool {
+        let (Some(&pa), Some(&pb)) = (self.vertices.get(a), self.vertices.get(b)) else { return false };
+        let midpoint = self.vertices.len();
+        self.vertices.push((pa + pb) * 0.5);
+        let mut split = false;
+        let mut output = Vec::with_capacity(self.triangles.len() * 2);
+        for triangle in self.triangles.iter().copied() {
+            let [t0, t1, t2] = triangle;
+            let forward = [t0, t1, t2].iter().position(|&v| v == a).and_then(|ia| {
+                let ib = (ia + 1) % 3;
+                ([t0, t1, t2][ib] == b).then_some((ia, ib, (ia + 2) % 3))
+            });
+            let reverse = [t0, t1, t2].iter().position(|&v| v == b).and_then(|ib| {
+                let ia = (ib + 1) % 3;
+                ([t0, t1, t2][ia] == a).then_some((ib, ia, (ib + 2) % 3))
+            });
+            if let Some((first, second, third)) = forward {
+                let tri = [t0, t1, t2];
+                output.push([tri[first], midpoint, tri[third]]);
+                output.push([midpoint, tri[second], tri[third]]);
+                split = true;
+            } else if let Some((first, second, third)) = reverse {
+                let tri = [t0, t1, t2];
+                output.push([tri[first], midpoint, tri[third]]);
+                output.push([midpoint, tri[second], tri[third]]);
+                split = true;
+            } else {
+                output.push(triangle);
+            }
+        }
+        if split {
+            self.triangles = output;
+            self.recompute_normals();
+        } else {
+            self.vertices.pop();
+        }
+        split
     }
 
     pub fn cube() -> Self {

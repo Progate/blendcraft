@@ -78,7 +78,7 @@ impl SceneObject {
     }
 
     pub fn transform_point(&self, point: Vec3) -> Vec3 {
-        point * self.scale.rotate(self.rotation) + self.translation
+        (point * self.scale).rotate(self.rotation) + self.translation
     }
 
     pub fn transform_direction(&self, direction: Vec3) -> Vec3 {

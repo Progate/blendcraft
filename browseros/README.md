@@ -15,9 +15,12 @@ Current scope:
 - scene/outliner with selectable objects
 - cube, plane, UV sphere, and cylinder primitives
 - object transforms, materials, visibility, duplicate/delete, undo/redo
-- object mode and basic edit-mode vertex dragging
-- orbit/pan/zoom camera and CPU shaded viewport
+- object mode and edit mode with vertex / edge / face selection
+- edit-mode face extrusion and inset, edge splitting, and mesh subdivision
+- orbit/pan/zoom camera, orthographic-style view presets, and CPU shaded viewport
+- per-pixel depth-buffered scene rasterization
 - `.blendcraft` JSON scene save/load
 - Wavefront OBJ import/export for triangle meshes
+- BrowserOS-path open/save/export dialogs inside the egui UI
 
 License: MIT OR Apache-2.0, same as the fork base.

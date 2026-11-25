@@ -9,6 +9,7 @@ pub struct ScreenTriangle {
     pub triangle_index: usize,
     pub points: [Pos2; 3],
     pub depth: f32,
+    pub vertex_depths: [f32; 3],
     pub color: Color32,
 }
 
@@ -44,6 +45,7 @@ pub fn render_scene(document: &Document, width: f32, height: f32) -> Vec<ScreenT
                 triangle_index,
                 points: [pa, pb, pc],
                 depth: (za + zb + zc) / 3.0,
+                vertex_depths: [za, zb, zc],
                 color: shade(object, normal),
             });
         }
@@ -61,4 +63,50 @@ pub fn point_in_triangle(point: Pos2, triangle: [Pos2; 3]) -> bool {
     let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
     let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
     !(negative && positive)
+}
+
+fn edge(a: Pos2, b: Pos2, point: Pos2) -> f32 {
+    (point.x - a.x) * (b.y - a.y) - (point.y - a.y) * (b.x - a.x)
+}
+
+/// Rasterize the scene with a per-pixel depth buffer. The editor's scenes are small, so a simple
+/// scan converter is fast enough and avoids the visible artifacts of triangle-level sorting when
+/// objects overlap or intersect.
+pub fn rasterize_scene(document: &Document, width: usize, height: usize) -> egui::ColorImage {
+    let mut pixels = vec![Color32::TRANSPARENT; width * height];
+    let mut depth_buffer = vec![f32::INFINITY; width * height];
+    let triangles = render_scene(document, width as f32, height as f32);
+    for triangle in triangles {
+        let [a, b, c] = triangle.points;
+        let area = edge(a, b, c);
+        if area.abs() <= f32::EPSILON {
+            continue;
+        }
+        let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as usize;
+        let max_x = a.x.max(b.x).max(c.x).ceil().min(width as f32) as usize;
+        let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as usize;
+        let max_y = a.y.max(b.y).max(c.y).ceil().min(height as f32) as usize;
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let point = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let wa = edge(b, c, point) / area;
+                let wb = edge(c, a, point) / area;
+                let wc = edge(a, b, point) / area;
+                if wa < -0.0001 || wb < -0.0001 || wc < -0.0001 {
+                    continue;
+                }
+                let inverse_depth = wa / triangle.vertex_depths[0] + wb / triangle.vertex_depths[1] + wc / triangle.vertex_depths[2];
+                if inverse_depth <= 0.0 {
+                    continue;
+                }
+                let depth = 1.0 / inverse_depth;
+                let index = y * width + x;
+                if depth < depth_buffer[index] {
+                    depth_buffer[index] = depth;
+                    pixels[index] = triangle.color;
+                }
+            }
+        }
+    }
+    egui::ColorImage::new([width, height], pixels)
 }
